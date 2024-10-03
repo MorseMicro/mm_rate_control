@@ -210,6 +210,16 @@
 #define SIGNIFICANT_VARIATION_THRESHOLD 5
 
 /**
+ * RSSI threshold for short range
+ */
+#define MMRC_SHORT_RANGE_RSSI_LIMIT -70
+
+/**
+ * RSSI threshold for mid range
+ */
+#define MMRC_MID_RANGE_RSSI_LIMIT -85
+
+/**
  * Checks if the desired gap in percentage is in range
  */
 #define MAX_ALLOWED_GAP(ref, new, perc) (((ref) - (new)) > ((ref) * (perc) / 100))
@@ -334,7 +344,7 @@ struct mmrc_rate get_rate_row(struct mmrc_table *tb, u16 index)
 		guard = MMRC_GUARD_LONG;
 
 	/* Validate guard against capability */
-	if (!(tb->caps.guard_per_bw & GUARD_PER_BW(bw, guard)))
+	if (guard == MMRC_GUARD_SHORT && !(tb->caps.sgi_per_bw & SGI_PER_BW(bw)))
 		guard = MMRC_GUARD_LONG;
 
 	/* Create our rate row and send it */
@@ -520,7 +530,7 @@ static u32 calculate_throughput(struct mmrc_table *tb, u8 index)
 						tb->table[rate.index].prob;
 }
 
-bool validate_rate(struct mmrc_rate *rate)
+bool validate_rate(struct mmrc_table *tb, struct mmrc_rate *rate)
 {
 #if MMRC_MODE == MMRC_MODE_80211AH
 	if (rate->rate == MMRC_MCS10 &&
@@ -562,6 +572,9 @@ bool validate_rate(struct mmrc_rate *rate)
 		return false;
 	}
 #endif
+	if (rate->guard == MMRC_GUARD_SHORT && !(tb->caps.sgi_per_bw & SGI_PER_BW(rate->bw)))
+		return false;
+
 	return true;
 }
 
@@ -580,7 +593,7 @@ static u16 find_baseline_index(struct mmrc_table *tb)
 	min_theoretical_tp = mmrc_calculate_theoretical_throughput(get_rate_row(tb, 0));
 	for (i = 0; i < row_count; i++)	{
 		rate = get_rate_row(tb, i);
-		if (!validate_rate(&rate))
+		if (!validate_rate(tb, &rate))
 			continue;
 
 		theoretical_tp = mmrc_calculate_theoretical_throughput(rate);
@@ -608,7 +621,7 @@ static struct mmrc_rate get_best_prob(struct mmrc_table *tb)
 
 	for (i = 0; i < rows_from_sta_caps(&tb->caps); i++) {
 		tmp = get_rate_row(tb, i);
-		if (!validate_rate(&tmp))
+		if (!validate_rate(tb, &tmp))
 			continue;
 
 		/**
@@ -630,6 +643,33 @@ static struct mmrc_rate get_best_prob(struct mmrc_table *tb)
 }
 
 /**
+ * Fill out the remaining rates to be used once the best rate is selected
+ */
+static void mmrc_fill_retry_rates(struct mmrc_table *tb)
+{
+	if (tb->best_tp.rate != MMRC_MCS0) {
+		tb->second_tp = tb->best_tp;
+		tb->second_tp.rate--;
+		rate_update_index(tb, &tb->second_tp);
+	}
+	/* For MCS 0 best rate just use the second rate already selected by the algorithm */
+
+	if (tb->second_tp.rate != MMRC_MCS0) {
+		tb->best_prob = tb->second_tp;
+		tb->best_prob.rate--;
+		rate_update_index(tb, &tb->best_prob);
+	} else {
+		tb->best_prob = get_best_prob(tb);
+	}
+
+	if (tb->best_prob.rate != MMRC_MCS0) {
+		tb->baseline = tb->best_prob;
+		tb->baseline.rate--;
+		rate_update_index(tb, &tb->baseline);
+	}
+}
+
+/**
  * Updates the mmrc_table with the appropriate rate priority based on the
  * latest update statistics
  */
@@ -645,34 +685,6 @@ static void generate_table_priority(struct mmrc_table *tb, u32 new_stats)
 	struct mmrc_rate tmp;
 	u32 tmp_tp;
 
-	/**
-	 * Alway fall back to basic rate when state changed to uninitialised
-	 * due to sharp drop in best rate probability or no feedback for long period of time.
-	 */
-	if (!tb->is_initialised) {
-		tb->best_tp.bw = MMRC_MAX_BW(tb->caps.bandwidth);
-		if (tb->caps.guard_per_bw & GUARD_PER_BW(tb->best_tp.bw, MMRC_GUARD_SHORT))
-			tb->best_tp.guard = MMRC_GUARD_TO_BITFIELD(MMRC_GUARD_SHORT);
-		else
-			tb->best_tp.guard = MMRC_GUARD_TO_BITFIELD(MMRC_GUARD_LONG);
-		tb->best_tp.rate = MMRC_RATE_TO_BITFIELD(MMRC_MCS0);
-#if MMRC_MODE == MMRC_MODE_80211AH
-		/**
-		 * To compensate for slow feedback when running with 1 and 2 MHz
-		 * bandwidth, we start from MCS3 which will correspond to a
-		 * reasonable feedbacks and will avoid resetting the rate table evidence.
-		 */
-		if (tb->best_tp.bw == MMRC_BW_1MHZ || tb->best_tp.bw == MMRC_BW_2MHZ)
-			tb->best_tp.rate = MMRC_RATE_TO_BITFIELD(MMRC_MCS3);
-#endif
-		tb->best_tp.ss = MMRC_SS_TO_BITFIELD(MMRC_SPATIAL_STREAM_1);
-		rate_update_index(tb, &tb->best_tp);
-		tb->second_tp.rate = MMRC_MCS_UNUSED;
-		tb->best_prob.rate = MMRC_MCS_UNUSED;
-		tb->baseline.rate = MMRC_MCS_UNUSED;
-		return;
-	}
-
 	/* Use fixed rate if set */
 	if (tb->fixed_rate.rate != MMRC_MCS_UNUSED) {
 		tb->best_tp = tb->fixed_rate;
@@ -683,7 +695,7 @@ static void generate_table_priority(struct mmrc_table *tb, u32 new_stats)
 
 	for (i = 0; i < rows_from_sta_caps(&tb->caps); i++) {
 		tmp = get_rate_row(tb, i);
-		if (!validate_rate(&tmp))
+		if (!validate_rate(tb, &tmp))
 			continue;
 
 		if (tb->table[tmp.index].evidence == 0)
@@ -718,27 +730,8 @@ static void generate_table_priority(struct mmrc_table *tb, u32 new_stats)
 	}
 
 	tb->best_tp = get_rate_row(tb, best_row);
-	if (tb->best_tp.rate != MMRC_MCS0) {
-		tb->second_tp = tb->best_tp;
-		tb->second_tp.rate--;
-		rate_update_index(tb, &tb->second_tp);
-	} else {
-		tb->second_tp = get_rate_row(tb, second_best_row);
-	}
-
-	if (tb->second_tp.rate != MMRC_MCS0) {
-		tb->best_prob = tb->second_tp;
-		tb->best_prob.rate--;
-		rate_update_index(tb, &tb->best_prob);
-	} else {
-		tb->best_prob = get_best_prob(tb);
-	}
-
-	if (tb->best_prob.rate != MMRC_MCS0) {
-		tb->baseline = tb->best_prob;
-		tb->baseline.rate--;
-		rate_update_index(tb, &tb->baseline);
-	}
+	tb->second_tp = get_rate_row(tb, second_best_row);
+	mmrc_fill_retry_rates(tb);
 
 	/* Only update stability when there is traffic */
 	if (!new_stats)
@@ -919,7 +912,7 @@ void mmrc_get_rates(struct mmrc_table *tb,
 			}
 			random = get_rate_row(tb, random_index);
 
-			if (!validate_rate(&random))
+			if (!validate_rate(tb, &random))
 				continue;
 
 #if MMRC_MODE == MMRC_MODE_80211AH
@@ -1021,6 +1014,12 @@ void mmrc_get_rates(struct mmrc_table *tb,
 		out->rates[best_index].attempts = MMRC_ATTEMPTS_TO_BITFIELD(2);
 }
 
+static u32 calc_ewma_average(u32 avg, u32 latest, u32 weight)
+{
+	MMRC_OSAL_ASSERT(weight <= 100);
+	return ((latest * (100 - weight)) + (avg * weight)) / 100;
+}
+
 static void mmrc_process_variation(struct mmrc_table *tb, u16 current_success, u32 index)
 {
 	u32 current_variation;
@@ -1041,8 +1040,8 @@ static void mmrc_process_variation(struct mmrc_table *tb, u16 current_success, u
 
 	/* Calculate the EWMA of the probability variation */
 	if (tb->probability_variation > 0)
-		tb->probability_variation = ((current_variation * (100 - VARIATION_EWMA)) +
-				(tb->probability_variation * VARIATION_EWMA)) / 100;
+		tb->probability_variation = calc_ewma_average(tb->probability_variation,
+							      current_variation, VARIATION_EWMA);
 	else
 		tb->probability_variation = current_variation;
 
@@ -1124,9 +1123,9 @@ void mmrc_update(struct mmrc_table *tb)
 
 		scaled_ewma = scale * EWMA / 100;
 
-		tb->table[i].evidence = ((tb->table[i].sent * EVIDENCE_SCALE *
-					     (100 - scaled_ewma)) +
-					 (tb->table[i].evidence * scaled_ewma)) / 100;
+		tb->table[i].evidence = calc_ewma_average(tb->table[i].evidence,
+							  tb->table[i].sent * EVIDENCE_SCALE,
+							  scaled_ewma);
 
 		if (tb->table[i].evidence > EVIDENCE_MAX)
 			tb->table[i].evidence = EVIDENCE_MAX;
@@ -1154,8 +1153,8 @@ void mmrc_update(struct mmrc_table *tb)
 			if (scaled_ewma)
 				mmrc_process_variation(tb, this_success, i);
 
-			tb->table[i].prob = ((this_success * (100 - scaled_ewma)) +
-					(tb->table[i].prob * scaled_ewma)) / 100;
+			tb->table[i].prob = calc_ewma_average(tb->table[i].prob, this_success,
+							      scaled_ewma);
 
 			/* Clear our sent statistics and update totals */
 			tb->table[i].total_sent += tb->table[i].sent;
@@ -1215,12 +1214,6 @@ void mmrc_feedback_agg(struct mmrc_table *tb,
 	u32 i;
 	u32 packet_count = success + failure;
 
-	/* Recover from unintialisated state upon the first feedback with success */
-	if (!tb->is_initialised) {
-		if (success)
-			tb->is_initialised = true;
-	}
-
 	for (i = 0; i < MMRC_MAX_CHAIN_LENGTH; i++) {
 		/* Calculate and update the index */
 		rate_update_index(tb, &rates->rates[i]);
@@ -1243,6 +1236,7 @@ void mmrc_feedback_agg(struct mmrc_table *tb,
 			tb->table[rates->rates[i].index].sent += packet_count * ind;
 			tb->table[rates->rates[i].index].sent_success += success;
 			tb->table[rates->rates[i].index].back_mpdu_success += success;
+			/* Intentionally double counting failures to further penalise */
 			tb->table[rates->rates[i].index].back_mpdu_failure += failure;
 			return;
 		}
@@ -1279,18 +1273,50 @@ void mmrc_feedback(struct mmrc_table *tb,
 		} else {
 			tb->table[rates->rates[i].index].sent += ind;
 			tb->table[rates->rates[i].index].sent_success += 1;
-			/**
-			 * We are in any sort of success feedback, recover from
-			 * unintialisated state.
-			 */
-			if (!tb->is_initialised)
-				tb->is_initialised = true;
 			return;
 		}
 	}
 }
 
-void mmrc_sta_init(struct mmrc_table *tb, struct mmrc_sta_capabilities *caps)
+/**
+ * Chooses a reasonable starting rate based on range (gathered from
+ * RSSI measurements) or bandwidth. Then fills out the 3 retry rates
+ * so a full set of rates is available.
+ *
+ * @param tb The mmrc table
+ * @param rssi The average RSSI from this peer node
+ */
+static void mmrc_init_rates(struct mmrc_table *tb, s8 rssi)
+{
+	tb->best_tp.bw = MMRC_MAX_BW(tb->caps.bandwidth);
+	if (tb->caps.sgi_per_bw & SGI_PER_BW(tb->best_tp.bw))
+		tb->best_tp.guard = MMRC_GUARD_TO_BITFIELD(MMRC_GUARD_SHORT);
+	else
+		tb->best_tp.guard = MMRC_GUARD_TO_BITFIELD(MMRC_GUARD_LONG);
+	tb->best_tp.rate = MMRC_RATE_TO_BITFIELD(MMRC_MCS0);
+#if MMRC_MODE == MMRC_MODE_80211AH
+	if (rssi < 0 && rssi >= MMRC_SHORT_RANGE_RSSI_LIMIT)
+		tb->best_tp.rate = MMRC_RATE_TO_BITFIELD(MMRC_MCS7);
+	else if (rssi < MMRC_SHORT_RANGE_RSSI_LIMIT && rssi >= MMRC_MID_RANGE_RSSI_LIMIT)
+		tb->best_tp.rate = MMRC_RATE_TO_BITFIELD(MMRC_MCS3);
+	else if (tb->best_tp.bw == MMRC_BW_1MHZ || tb->best_tp.bw == MMRC_BW_2MHZ)
+		/**
+		 * To compensate for slow feedback when running with 1 and 2 MHz
+		 * bandwidth, we start from MCS3 which will correspond to
+		 * reasonable feedback and will avoid resetting the rate table evidence.
+		 */
+		tb->best_tp.rate = MMRC_RATE_TO_BITFIELD(MMRC_MCS3);
+#endif
+	tb->best_tp.ss = MMRC_SS_TO_BITFIELD(MMRC_SPATIAL_STREAM_1);
+	rate_update_index(tb, &tb->best_tp);
+	/* Init every rate in case they are needed to set the retry rates */
+	tb->second_tp = tb->best_tp;
+	tb->best_prob = tb->best_tp;
+	tb->baseline = tb->best_tp;
+	mmrc_fill_retry_rates(tb);
+}
+
+void mmrc_sta_init(struct mmrc_table *tb, struct mmrc_sta_capabilities *caps, s8 rssi)
 {
 	u32 i;
 	u16 row_count = rows_from_sta_caps(caps);
@@ -1307,7 +1333,6 @@ void mmrc_sta_init(struct mmrc_table *tb, struct mmrc_sta_capabilities *caps)
 		tb->table[i].max_throughput = 0;
 	}
 
-	tb->is_initialised = false;
 	tb->fixed_rate.rate = MMRC_MCS_UNUSED;
 	tb->cycle_cnt = 0;
 	tb->last_lookaround_cycle = 0;
@@ -1315,7 +1340,7 @@ void mmrc_sta_init(struct mmrc_table *tb, struct mmrc_sta_capabilities *caps)
 	tb->lookaround_wrap = LOOKAROUND_RATE_INIT;
 	tb->stability_cnt_threshold = STABILITY_CNT_THRESHOLD_INIT;
 	tb->baseline = get_rate_row(tb, find_baseline_index(tb));
-	generate_table_priority(tb, 0);
+	mmrc_init_rates(tb, rssi);
 
 	MMRC_OSAL_ASSERT(tb->caps.max_rates);
 	MMRC_OSAL_ASSERT(tb->caps.max_retries);
@@ -1332,7 +1357,7 @@ bool mmrc_set_fixed_rate(struct mmrc_table *tb, struct mmrc_rate fixed_rate)
 	    (MMRC_MASK(fixed_rate.guard) & tb->caps.guard) == 0)
 		caps_support_rate = false;
 
-	if (validate_rate(&fixed_rate) && caps_support_rate) {
+	if (validate_rate(tb, &fixed_rate) && caps_support_rate) {
 		tb->fixed_rate = fixed_rate;
 		rate_update_index(tb, &tb->fixed_rate);
 		return true;

@@ -189,7 +189,7 @@ struct mmrc_rate_table {
 	struct mmrc_rate rates[MMRC_MAX_CHAIN_LENGTH];
 };
 
-#define GUARD_PER_BW(bw, guard)		(MMRC_MASK(guard) << (2 * (bw)))
+#define SGI_PER_BW(bw)		(1 << (bw))
 
 /**
  * Capabilities of an individual STA
@@ -217,7 +217,7 @@ struct mmrc_sta_capabilities {
 	u8 sta_flags	: 4;
 
 	/** Per BW supported guards of the STA (2 bits per BW) */
-	u16 guard_per_bw	: 10;
+	u8 sgi_per_bw	: 5;
 };
 
 /**
@@ -273,13 +273,6 @@ struct mmrc_stats_table {
  * Store of information the MMRC module requires for a STA
  */
 struct mmrc_table {
-	/**
-	 * In case MMRC does not have up-to-date rate table, it should fall
-	 * back to a set of pre-determind base rates to rapidly acquire that
-	 * information
-	 */
-	bool is_initialised;
-
 	/** The capabilities of the STA */
 	struct mmrc_sta_capabilities caps;
 
@@ -361,12 +354,13 @@ struct mmrc_table {
  *
  * @param tb A pointer to an empty mmrc_sta_capabilities struct.
  * @param caps The capabilities of this STA.
+ * @param rssi The average RSSI value for this station.
  *
  * @note If the STA capabilities change this function will need to be called again
  * and the @c mmrc_table may need to be reallocated if allocated using
  * @ref mmrc_memory_required_for_caps
  */
-void mmrc_sta_init(struct mmrc_table *tb, struct mmrc_sta_capabilities *caps);
+void mmrc_sta_init(struct mmrc_table *tb, struct mmrc_sta_capabilities *caps, s8 rssi);
 
 /**
  * Calculate the size of the mmrc_table required for these capabilities.
@@ -458,7 +452,7 @@ u32 get_tx_time(struct mmrc_rate *rate);
  * @param rate The rate to validate
  * @returns bool If the rate is valid
  */
-bool validate_rate(struct mmrc_rate *rate);
+bool validate_rate(struct mmrc_table *tb, struct mmrc_rate *rate);
 
 /**
  * Takes an index in an mmrc_table and calculate the capabilities
