@@ -1,19 +1,7 @@
 /*
  * Copyright 2022 Morse Micro
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see
- * <https://www.gnu.org/licenses/>.
+ * SPDX-License-Identifier: GPL-2.0-or-later OR LicenseRef-MorseMicroCommercial
  *
  */
 
@@ -480,8 +468,18 @@ void rate_update_index(struct mmrc_table *tb, struct mmrc_rate *rate);
  * Calculate the theoretical thoughput of a given rate
  *
  * @param rate The rate with updated index, bandwidth, spatial-streams and guard
- * @returns u32 The standard data rate in Kbps
+ * @returns u32 The standard data rate in bps
  */
 u32 mmrc_calculate_theoretical_throughput(struct mmrc_rate rate);
+
+/**
+ * Gets best MRRC rate from given rate table.
+ *
+ * @param tb pointer to a mmrc table.
+ *
+ * @returns The MMRC rate with the best throughput.
+ */
+
+struct mmrc_rate mmrc_sta_get_best_rate(struct mmrc_table *tb);
 
 #endif /* _MMRC_H_ */
