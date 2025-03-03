@@ -198,6 +198,16 @@
 #define SIGNIFICANT_VARIATION_THRESHOLD 5
 
 /**
+ * If the best rate changes twice in this number of cycles, it is unstable
+ */
+#define BEST_RATE_UNSTABLE_THRESHOLD 4
+
+/**
+ * Once the best rate is unchanged for this number of cycles it has converged
+ */
+#define BEST_RATE_CONVERGED_THRESHOLD 10
+
+/**
  * RSSI threshold for short range
  */
 #define MMRC_SHORT_RANGE_RSSI_LIMIT -70
@@ -595,66 +605,32 @@ static u16 find_baseline_index(struct mmrc_table *tb)
 }
 
 /**
- * Retrieves the index of the rate in the mmrc_table_t with the best
- * likelihood of succeeding.
- */
-static struct mmrc_rate get_best_prob(struct mmrc_table *tb)
-{
-	u32 i;
-	u16 best_row = 0;
-	struct mmrc_rate rate;
-	struct mmrc_rate tmp;
-	u32 best_prob = 0;
-	u32 theoretical_tp, best_prob_throughput = 0;
-
-	for (i = 0; i < rows_from_sta_caps(&tb->caps); i++) {
-		tmp = get_rate_row(tb, i);
-		if (!validate_rate(tb, &tmp))
-			continue;
-
-		/**
-		 *  Consider the rate only if its probability value is greater,
-		 *  then check its throughput.
-		 */
-		if (tb->table[tmp.index].prob > best_prob) {
-			theoretical_tp = mmrc_calculate_theoretical_throughput(tmp);
-			if (theoretical_tp > best_prob_throughput) {
-				best_prob_throughput = theoretical_tp;
-				best_prob = tb->table[tmp.index].prob;
-				best_row = tmp.index;
-			}
-		}
-	}
-
-	rate = get_rate_row(tb, best_row);
-	return rate;
-}
-
-/**
- * Fill out the remaining rates to be used once the best rate is selected
+ * Fill out the remaining rates to be used once the best rate is selected.
+ * Normally the retry rates are one MCS lower than the previous, however in
+ * unconverged mode we limit the 3 respective retry rates to MCS 4, 2 and 0
+ * respectively. The last retry rate is always MCS 0
  */
 static void mmrc_fill_retry_rates(struct mmrc_table *tb)
 {
-	if (tb->best_tp.rate != MMRC_MCS0) {
-		tb->second_tp = tb->best_tp;
+	tb->second_tp = tb->best_tp;
+	if (tb->second_tp.rate != MMRC_MCS0) {
 		tb->second_tp.rate--;
+		if (tb->unconverged && tb->second_tp.rate > MMRC_MCS4)
+			tb->second_tp.rate = MMRC_MCS4;
 		rate_update_index(tb, &tb->second_tp);
 	}
-	/* For MCS 0 best rate just use the second rate already selected by the algorithm */
 
-	if (tb->second_tp.rate != MMRC_MCS0) {
-		tb->best_prob = tb->second_tp;
-		tb->best_prob.rate--;
-		rate_update_index(tb, &tb->best_prob);
-	} else {
-		tb->best_prob = get_best_prob(tb);
-	}
-
+	tb->best_prob = tb->second_tp;
 	if (tb->best_prob.rate != MMRC_MCS0) {
-		tb->baseline = tb->best_prob;
-		tb->baseline.rate--;
-		rate_update_index(tb, &tb->baseline);
+		tb->best_prob.rate--;
+		if (tb->unconverged && tb->best_prob.rate > MMRC_MCS2)
+			tb->best_prob.rate = MMRC_MCS2;
+		rate_update_index(tb, &tb->best_prob);
 	}
+
+	tb->baseline = tb->best_prob;
+	tb->baseline.rate = MMRC_MCS0;
+	rate_update_index(tb, &tb->baseline);
 }
 
 /**
@@ -665,7 +641,8 @@ static void generate_table_priority(struct mmrc_table *tb, u32 new_stats)
 {
 	u16 i;
 	u16 best_row = tb->best_tp.index;
-	u16 best_row_prev = best_row;
+	u16 prev_best_row = best_row;
+	u8 prev_best_rate = tb->best_tp.rate;
 	u16 second_best_row = tb->second_tp.index;
 	u32 best_tp = calculate_throughput(tb, best_row);
 	u32 second_best_tp = calculate_throughput(tb, second_best_row);
@@ -698,7 +675,7 @@ static void generate_table_priority(struct mmrc_table *tb, u32 new_stats)
 
 		if (tmp_tp > best_tp ||
 		    (tb->table[tmp.index].max_throughput <=
-						tb->table[best_row_prev].max_throughput &&
+						tb->table[prev_best_row].max_throughput &&
 		     tb->table[tmp.index].prob >= PROBABILITY_DIP_RECOVERY_MIN &&
 		     tb->table[tmp.index].prob > tb->table[last_nonzero_prob].prob)) {
 			second_best_row = best_row;
@@ -717,15 +694,20 @@ static void generate_table_priority(struct mmrc_table *tb, u32 new_stats)
 			last_nonzero_prob = tmp.index;
 	}
 
-	tb->best_tp = get_rate_row(tb, best_row);
-	tb->second_tp = get_rate_row(tb, second_best_row);
-	mmrc_fill_retry_rates(tb);
-
-	/* Only update stability when there is traffic */
+	/* Only update rates and stability when there are new statistics */
 	if (!new_stats)
 		return;
 
-	if (tb->best_tp.rate > MMRC_MCS1 && best_row_prev == best_row) {
+	tb->best_tp = get_rate_row(tb, best_row);
+	if (best_tp == 0 && tb->best_tp.rate > MMRC_MCS0) {
+		/* Drop one rate, as the best throughput is zero */
+		tb->best_tp.rate--;
+		rate_update_index(tb, &tb->best_tp);
+	}
+	tb->second_tp = get_rate_row(tb, second_best_row);
+	mmrc_fill_retry_rates(tb);
+
+	if (tb->best_tp.rate > MMRC_MCS1 && prev_best_row == best_row) {
 		/* Increase the counter when the best rate is not changed */
 		tb->stability_cnt++;
 	} else if (tb->stability_cnt > STABILITY_BACKOFF_STEP) {
@@ -735,14 +717,47 @@ static void generate_table_priority(struct mmrc_table *tb, u32 new_stats)
 		tb->stability_cnt = 0;
 	}
 
-	if (best_row_prev != best_row) {
-		tb->best_rate_cycle_count = 0;
-		if (!tb->interference_likely)
+	if (prev_best_row != best_row) {
+		s8 latest_best_rate_diff = prev_best_rate - tb->best_tp.rate;
+		u8 total_abs_best_rate_diff = abs(tb->best_rate_diff[0] +
+			tb->best_rate_diff[1] + latest_best_rate_diff);
+
+		if (!tb->interference_likely) {
 			tb->probability_variation = 0;
+			if (!tb->unconverged &&
+			    tb->best_rate_cycle_count <= BEST_RATE_UNSTABLE_THRESHOLD &&
+			    total_abs_best_rate_diff >= 2) {
+				/*
+				 * Best rate has changed twice in a few cycles and moved at least
+				 * 2 MCSs from where it was 3 best rate changes ago
+				 */
+				tb->unconverged = true;
+				tb->newly_unconverged = true;
+			}
+		}
+		if (tb->unconverged && !tb->newly_unconverged &&
+		    total_abs_best_rate_diff < 2) {
+			/*
+			 * Best rate has been relatively stable (not moved more than 1 MCS
+			 * after the last 3 rate changes), go back to converged
+			 */
+			tb->unconverged = false;
+		}
 		tb->probability_variation_direction = 0;
+		tb->best_rate_cycle_count = 0;
+		tb->best_rate_diff[0] = tb->best_rate_diff[1];
+		tb->best_rate_diff[1] = latest_best_rate_diff;
 	} else {
 		tb->best_rate_cycle_count++;
+		if (tb->unconverged && !tb->newly_unconverged &&
+		    tb->best_rate_cycle_count >= BEST_RATE_CONVERGED_THRESHOLD) {
+			/* Best rate has been stable for a while, go back to converged */
+			tb->unconverged = false;
+		}
 	}
+
+	if (tb->newly_unconverged)
+		tb->newly_unconverged = false;
 }
 
 static u32 calculate_attempt_time(struct mmrc_rate *rate, size_t size)
@@ -1005,6 +1020,10 @@ void mmrc_get_rates(struct mmrc_table *tb,
 static u32 calc_ewma_average(u32 avg, u32 latest, u32 weight)
 {
 	MMRC_OSAL_ASSERT(weight <= 100);
+
+	if (avg == 0)
+		return latest;
+
 	return ((latest * (100 - weight)) + (avg * weight)) / 100;
 }
 
@@ -1017,7 +1036,19 @@ static void mmrc_process_variation(struct mmrc_table *tb, u16 current_success, u
 	 * rate to have enough data to see the variation and its statistics are more
 	 * affected because they are usually collected over the full period.
 	 */
-	if (index != tb->best_tp.index || tb->table[index].prob == 0)
+	if (index != tb->best_tp.index)
+		return;
+
+	if (current_success == 0) {
+		if (!tb->unconverged) {
+			/* Best rate is failing completely, go to unconverged mode */
+			tb->unconverged = true;
+			tb->newly_unconverged = true;
+		}
+		return;
+	}
+
+	if (tb->table[index].prob == 0)
 		return;
 
 	/* Don't process variation while converging after association */
@@ -1027,11 +1058,8 @@ static void mmrc_process_variation(struct mmrc_table *tb, u16 current_success, u
 	current_variation = abs(current_success - tb->table[index].prob);
 
 	/* Calculate the EWMA of the probability variation */
-	if (tb->probability_variation > 0)
-		tb->probability_variation = calc_ewma_average(tb->probability_variation,
-							      current_variation, VARIATION_EWMA);
-	else
-		tb->probability_variation = current_variation;
+	tb->probability_variation = calc_ewma_average(tb->probability_variation,
+						      current_variation, VARIATION_EWMA);
 
 	/* Process the variation direction to distinguish converged and unconverged scenarios */
 	if (tb->probability_variation >= MODERATE_VARIATION_THRESHOLD || tb->interference_likely) {
@@ -1060,7 +1088,7 @@ static void mmrc_process_variation(struct mmrc_table *tb, u16 current_success, u
 		}
 	} else if (tb->interference_likely &&
 			(tb->probability_variation <= MINOR_VARIATION_THRESHOLD ||
-			 abs(tb->probability_variation_direction == MAX_VARIATION_DIRECTION))) {
+			 abs(tb->probability_variation_direction) == MAX_VARIATION_DIRECTION)) {
 		/*
 		 * Exit interference mode if the variability drops or the direction
 		 * stops being random
@@ -1123,10 +1151,12 @@ void mmrc_update(struct mmrc_table *tb)
 				tb->table[i].back_mpdu_failure;
 		success_for_stats = tb->table[i].back_mpdu_success;
 
-		/* Use all attempts if there were no AMPDUs for this rate or the remaining
-		 * attempts are less than half of what we have from AMPDUs.
+		/* Use the full statistics if rates are not converged or there were no AMPDUs
+		 * for this rate or the remaining attempts are less than half of what we have
+		 * from AMPDUs.
 		 */
 		if (!tb->table[i].have_sent_ampdus ||
+		    tb->unconverged ||
 		    attempts_for_stats < AMPDU_STATS_MIN ||
 		    (tb->table[i].sent - attempts_for_stats < attempts_for_stats / 2)) {
 			attempts_for_stats = tb->table[i].sent;
@@ -1175,13 +1205,13 @@ void mmrc_update(struct mmrc_table *tb)
 
 	generate_table_priority(tb, new_stats);
 
-	/* Switch to faster lookaround mode if rates drop low at very low bandwidth.
-	 * This is to help recover quickly from rates at which we need to fragment a
-	 * standard MTU size packet when the conditions allow.
+	/* Switch to faster lookaround mode if rates drop low at very low bandwidth or we are
+	 * in unconverged mode. Switching at low bandwidth and rate is to help recover quickly
+	 * from rates where we would need to fragment standard MTU size packets.
 	 */
-	if (tb->best_tp.bw == MMRC_BW_1MHZ &&
-	    tb->best_tp.rate <= MMRC_MCS2 &&
-	    tb->lookaround_wrap != LOOKAROUND_RATE_INIT) {
+	if (tb->lookaround_wrap != LOOKAROUND_RATE_INIT &&
+	    (tb->unconverged ||
+	     (tb->best_tp.bw == MMRC_BW_1MHZ && tb->best_tp.rate <= MMRC_MCS2))) {
 		tb->lookaround_cnt = 0;
 		tb->lookaround_wrap = LOOKAROUND_RATE_INIT;
 		tb->stability_cnt_threshold = STABILITY_CNT_THRESHOLD_INIT;
@@ -1283,7 +1313,7 @@ static void mmrc_init_rates(struct mmrc_table *tb, s8 rssi)
 		tb->best_tp.guard = MMRC_GUARD_TO_BITFIELD(MMRC_GUARD_LONG);
 	tb->best_tp.rate = MMRC_RATE_TO_BITFIELD(MMRC_MCS0);
 #if MMRC_MODE == MMRC_MODE_80211AH
-	if (rssi < 0 && rssi >= MMRC_SHORT_RANGE_RSSI_LIMIT)
+	if (rssi >= MMRC_SHORT_RANGE_RSSI_LIMIT)
 		tb->best_tp.rate = MMRC_RATE_TO_BITFIELD(MMRC_MCS7);
 	else if (rssi < MMRC_SHORT_RANGE_RSSI_LIMIT && rssi >= MMRC_MID_RANGE_RSSI_LIMIT)
 		tb->best_tp.rate = MMRC_RATE_TO_BITFIELD(MMRC_MCS3);
@@ -1326,6 +1356,8 @@ void mmrc_sta_init(struct mmrc_table *tb, struct mmrc_sta_capabilities *caps, s8
 	tb->last_lookaround_cycle = 0;
 	tb->lookaround_cnt = 0;
 	tb->lookaround_wrap = LOOKAROUND_RATE_INIT;
+	tb->unconverged = true;
+	tb->newly_unconverged = true;
 	tb->stability_cnt_threshold = STABILITY_CNT_THRESHOLD_INIT;
 	tb->baseline = get_rate_row(tb, find_baseline_index(tb));
 	mmrc_init_rates(tb, rssi);

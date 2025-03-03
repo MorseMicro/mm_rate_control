@@ -318,11 +318,20 @@ struct mmrc_table {
 	/** Best rate variation EWMA */
 	u8 probability_variation;
 
+	/** The difference in MCS from each of the last 2 rate changes */
+	s8 best_rate_diff[2];
+
 	/** Indication of random versus consistently one-sided variation */
 	s8 probability_variation_direction;
 
 	/** Has rate control detected possible interference */
 	bool interference_likely;
+
+	/** Has rate control detected the best rate is no longer converged */
+	bool unconverged;
+
+	/** Is rate control just entering unconverged state */
+	bool newly_unconverged;
 
 	/** Number of rate control cycles the best rate has remained unchanged */
 	s32 best_rate_cycle_count;
