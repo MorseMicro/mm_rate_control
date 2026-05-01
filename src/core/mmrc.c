@@ -57,7 +57,7 @@
  * Limit the number of times we try to pick a theoretically better rate to sample.
  * Necessary so we don't stall the CPU, due to constantly picking worse rates.
  */
-#define LOOKAROUND_FAIL_MAX 50
+#define LOOKAROUND_FAIL_MAX 200
 
 /**
  * Initial and reset probability per rate in the table
@@ -914,8 +914,6 @@ void mmrc_get_rates(struct mmrc_table *tb,
 		best_tp = calculate_throughput(tb, tb->best_tp.index);
 
 		/* Generate a lookaround */
-		osal_mmrc_seed_random();
-
 		for (lookaround_fail_count = 0;
 			lookaround_fail_count < LOOKAROUND_FAIL_MAX;
 			lookaround_fail_count++) {
@@ -1110,6 +1108,12 @@ static void mmrc_process_variation(struct mmrc_table *tb, u16 current_success, u
 	}
 }
 
+static bool enough_stats(struct mmrc_table *tb, u32 min_stats, u32 index, u32 attempts_for_stats)
+{
+	return (attempts_for_stats >= min_stats ||
+		(attempts_for_stats > 0 && tb->table[index].prob > 0));
+}
+
 void mmrc_update(struct mmrc_table *tb)
 {
 	u32 i;
@@ -1121,6 +1125,7 @@ void mmrc_update(struct mmrc_table *tb)
 	u32 success_for_stats;
 	u32 min_stats;
 	u32 throughput;
+	bool process_this_rate;
 	u32 evidence_sent;
 
 	tb->cycle_cnt++;
@@ -1153,15 +1158,6 @@ void mmrc_update(struct mmrc_table *tb)
 
 		scaled_ewma = scale * EWMA / 100;
 
-		/* Only count new packets for evidence if we will process them */
-		evidence_sent = tb->table[i].sent >= min_stats ? tb->table[i].sent : 0;
-		tb->table[i].evidence = calc_ewma_average(tb->table[i].evidence,
-							  evidence_sent * EVIDENCE_SCALE,
-							  scaled_ewma);
-
-		if (tb->table[i].evidence > EVIDENCE_MAX)
-			tb->table[i].evidence = EVIDENCE_MAX;
-
 		/* Try to use statistics from acknowledged AMPDUs first*/
 		attempts_for_stats = tb->table[i].back_mpdu_success +
 				tb->table[i].back_mpdu_failure;
@@ -1179,8 +1175,17 @@ void mmrc_update(struct mmrc_table *tb)
 			success_for_stats = tb->table[i].sent_success;
 		}
 
-		if (attempts_for_stats >= min_stats ||
-		    (attempts_for_stats > 0 && tb->table[i].prob > 0)) {
+		process_this_rate = enough_stats(tb, min_stats, i, attempts_for_stats);
+
+		/* Only count new packets for evidence if we will process them */
+		evidence_sent = process_this_rate ? tb->table[i].sent : 0;
+		tb->table[i].evidence = calc_ewma_average(tb->table[i].evidence,
+							  evidence_sent * EVIDENCE_SCALE,
+							  scaled_ewma);
+		if (tb->table[i].evidence > EVIDENCE_MAX)
+			tb->table[i].evidence = EVIDENCE_MAX;
+
+		if (process_this_rate) {
 			new_stats = 1;
 			this_success = (100 * success_for_stats) / attempts_for_stats;
 
@@ -1238,75 +1243,34 @@ void mmrc_update(struct mmrc_table *tb)
 		tb->current_lookaround_rate_attempts = LOOKAROUND_RATE_ATTEMPTS;
 }
 
-void mmrc_feedback_agg(struct mmrc_table *tb,
-		       struct mmrc_rate_table *rates,
-		       s32 retry_count,
-		       u32 success,
-		       u32 failure)
+void mmrc_feedback(struct mmrc_table *tb,
+		   struct mmrc_rate_table *rates,
+		   s32 retry_count,
+		   bool was_aggregated)
 {
 	s32 ind = retry_count;
 	u32 i;
-	u32 packet_count = success + failure;
 
 	for (i = 0; i < MMRC_MAX_CHAIN_LENGTH; i++) {
-		/* Calculate and update the index */
 		rate_update_index(tb, &rates->rates[i]);
-		tb->table[rates->rates[i].index].have_sent_ampdus = true;
+		tb->table[rates->rates[i].index].have_sent_ampdus |= was_aggregated;
 
 		if ((s32)rates->rates[i].attempts < ind) {
 			ind = ind - rates->rates[i].attempts;
 			tb->table[rates->rates[i].index].sent +=
-				rates->rates[i].attempts * packet_count;
-
-			/**
-			 * Assumes that retry count is incremented if the last
-			 * rate in the table fails to send
-			 */
-			if (ind == 0) {
-				/* We have used up all retries with no success */
-				return;
-			}
-		} else {
-			tb->table[rates->rates[i].index].sent += packet_count * ind;
-			tb->table[rates->rates[i].index].sent_success += success;
-			tb->table[rates->rates[i].index].back_mpdu_success += success;
-			/* Intentionally double counting failures to further penalise */
-			tb->table[rates->rates[i].index].back_mpdu_failure += failure;
-			return;
-		}
-	}
-}
-
-void mmrc_feedback(struct mmrc_table *tb,
-		   struct mmrc_rate_table *rates,
-		   s32 retry_count)
-{
-	s32 ind = retry_count;
-	u32 i;
-
-	for (i = 0; i < MMRC_MAX_CHAIN_LENGTH; i++) {
-		/* Calculate and update the index */
-		rate_update_index(tb, &rates->rates[i]);
-		if (retry_count == -1) {
-			tb->table[rates->rates[i].index].sent = rates->rates[i].attempts;
-			continue;
-		}
-
-		if ((s32)rates->rates[i].attempts < ind) {
-			tb->table[rates->rates[i].index].sent += rates->rates[i].attempts;
-			ind = ind - rates->rates[i].attempts;
-
-			/**
-			 * Assumes that retry count is incremented if the last
-			 * rate in the table fails to send.
-			 */
-			if (ind == 0) {
-				/* We have used up all retries with no success */
-				return;
+				rates->rates[i].attempts;
+			if (was_aggregated) {
+				tb->table[rates->rates[i].index].back_mpdu_failure +=
+					rates->rates[i].attempts;
 			}
 		} else {
 			tb->table[rates->rates[i].index].sent += ind;
 			tb->table[rates->rates[i].index].sent_success += 1;
+			if (was_aggregated) {
+				tb->table[rates->rates[i].index].back_mpdu_success += 1;
+				tb->table[rates->rates[i].index].back_mpdu_failure +=
+					ind > 1 ? ind - 1 : 0;
+			}
 			return;
 		}
 	}
@@ -1405,4 +1369,9 @@ bool mmrc_set_fixed_rate(struct mmrc_table *tb, struct mmrc_rate fixed_rate)
 	}
 
 	return false;
+}
+
+void mmrc_init(void)
+{
+	osal_mmrc_seed_random();
 }

@@ -204,7 +204,7 @@ struct mmrc_sta_capabilities {
 	/** Flags of relevant features supported by the STA, e.g. dynamic SMPS... */
 	u8 sta_flags	: 4;
 
-	/** Per BW supported guards of the STA (2 bits per BW) */
+	/** Short GI supported per bandwidth (bitfield) */
 	u8 sgi_per_bw	: 5;
 };
 
@@ -386,26 +386,12 @@ void mmrc_get_rates(struct mmrc_table *tb,
  * @param rates The rate table used to send the last packet
  * @param retry_count The amount of retries attempted using the last
  *	rate table
+ * @param was_aggregated True if this packet was ever aggregated
  */
 void mmrc_feedback(struct mmrc_table *tb,
 		   struct mmrc_rate_table *rates,
-		   s32 retry_count);
-
-/**
- * Feedback to MMRC based on aggregated frames.
- *
- * @param tb Pointer to a mmrc table to update
- * @param rates The rate table used to send the last packet
- * @param retry_count The amount of retries attempted using the last
- *      rate table
- * @param success The amount of successfully sent frames in the A-MPDU
- * @param failure The amount of unsuccessfully sent frames in the A-MPDU
- */
-void mmrc_feedback_agg(struct mmrc_table *tb,
-		       struct mmrc_rate_table *rates,
-		       s32 retry_count,
-		       u32 success,
-		       u32 failure);
+		   s32 retry_count,
+		   bool was_aggregated);
 
 /**
  * Update an MMRC table from the most recent stats.
@@ -488,7 +474,11 @@ u32 mmrc_calculate_theoretical_throughput(struct mmrc_rate rate);
  *
  * @returns The MMRC rate with the best throughput.
  */
-
 struct mmrc_rate mmrc_sta_get_best_rate(struct mmrc_table *tb);
+
+/**
+ * Initialize the MMRC module
+ */
+void mmrc_init(void);
 
 #endif /* _MMRC_H_ */
