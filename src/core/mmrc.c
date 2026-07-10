@@ -668,6 +668,8 @@ static void mmrc_fill_retry_rates(struct mmrc_table *tb)
 		tb->best_prob.rate--;
 		if (tb->unconverged && tb->best_prob.rate > MMRC_MCS2)
 			tb->best_prob.rate = MMRC_MCS2;
+		else if (tb->best_prob.rate > MMRC_MCS4)
+			tb->best_prob.rate = MMRC_MCS4;
 		rate_update_index(tb, &tb->best_prob);
 	} else if (tb->best_prob.bw > MMRC_BW_1MHZ) {
 		tb->best_prob.bw--;
